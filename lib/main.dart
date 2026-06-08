@@ -4,9 +4,9 @@ import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
 
 import 'models/telemetry_data.dart';
+import 'services/csv_telemetry_simulator.dart';
 import 'services/logging_service.dart';
 import 'services/serial_service.dart';
-import 'services/simulation_service.dart';
 import 'utils/telemetry_parser.dart';
 
 void main() {
@@ -19,7 +19,7 @@ class AksTelemetryApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'AKS Telemetri Paneli',
+      title: 'AKS Telemetri Sistemi',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
@@ -39,68 +39,173 @@ class TelemetryHomePage extends StatefulWidget {
 }
 
 class _TelemetryHomePageState extends State<TelemetryHomePage> {
-  final SimulationService _simulationService = SimulationService();
-  final SerialService _serialService = SerialService();
+  final CsvTelemetrySimulator _csvSimulator = CsvTelemetrySimulator();
   final LoggingService _loggingService = LoggingService();
+  final SerialService _serialService = SerialService();
 
   TelemetryData _telemetryData = TelemetryData.empty();
 
   String _lastRawData = 'Henüz veri alınmadı.';
-  String _connectionStatus = 'Bağlı değil';
+  String _connectionStatus = 'Veri seti bekleniyor';
   String _loggingStatus = 'Kapalı';
   String _logFilePath = '-';
 
   bool _isSimulationRunning = false;
-  bool _isSerialConnected = false;
   bool _isLogging = false;
+  bool _isCsvLoaded = false;
+  bool _hasReceivedData = false;
+  bool _isSerialConnected = false;
 
   List<String> _availablePorts = [];
   String? _selectedPort;
 
-  final List<FlSpot> _speedPoints = [];
-  final List<FlSpot> _socPoints = [];
+  final List<FlSpot> _voltagePoints = [];
+  final List<FlSpot> _groundTruthSocPoints = [];
   double _chartIndex = 0;
 
   @override
   void initState() {
     super.initState();
     _refreshPorts();
+    _loadDataset();
   }
+
+
+Future<void> _loadDataset() async {
+  try {
+    await _csvSimulator.loadCsv();
+
+    setState(() {
+      _isCsvLoaded = true;
+      _connectionStatus = 'Veri seti hazır';
+    });
+  } catch (e) {
+    setState(() {
+      _isCsvLoaded = false;
+      _isSimulationRunning = false;
+      _connectionStatus = 'Veri seti yüklenemedi';
+    });
+  }
+}
 
   void _refreshPorts() {
     final ports = _serialService.getAvailablePorts();
 
     setState(() {
       _availablePorts = ports;
-      _selectedPort = ports.isNotEmpty ? (_selectedPort ?? ports.first) : null;
+
+      if (ports.isNotEmpty) {
+        if (_selectedPort == null || !ports.contains(_selectedPort)) {
+          _selectedPort = ports.first;
+        }
+      } else {
+        _selectedPort = null;
+      }
     });
   }
 
-  Future<void> _handleIncomingData(String rawData) async {
+  Future<void> _handleIncomingRawData(String rawData) async {
     final parsedData = TelemetryParser.parse(rawData);
 
-    if (parsedData != null) {
+    if (parsedData == null) {
       setState(() {
-        _telemetryData = parsedData;
-        _lastRawData = rawData;
-
-        _chartIndex++;
-        _speedPoints.add(FlSpot(_chartIndex, parsedData.speed));
-        _socPoints.add(FlSpot(_chartIndex, parsedData.soc));
-
-        if (_speedPoints.length > 20) {
-          _speedPoints.removeAt(0);
-        }
-
-        if (_socPoints.length > 20) {
-          _socPoints.removeAt(0);
-        }
+        _lastRawData = 'Parse edilemeyen veri: $rawData';
       });
-
-      if (_isLogging) {
-        await _loggingService.writeData(parsedData);
-      }
+      return;
     }
+
+    await _handleIncomingData(parsedData);
+  }
+
+  Future<void> _handleIncomingData(TelemetryData data) async {
+    final warnings = _generateWarnings(data);
+    final status = _getStatusText(warnings);
+
+    final rawData =
+        'timeMs:${data.timeMs.toStringAsFixed(0)},'
+        'voltage:${data.voltage.toStringAsFixed(2)},'
+        'current:${data.current.toStringAsFixed(2)},'
+        'temperature:${data.temperature.toStringAsFixed(2)},'
+        'motorSpeedRpm:${data.motorSpeedRpm.toStringAsFixed(0)},'
+        'hallCode:${data.hallCode},'
+        'estimatedSoc:${data.estimatedSoc.toStringAsFixed(2)},'
+        'groundTruthSoc:${data.groundTruthSoc.toStringAsFixed(2)},'
+        'residual:${data.residual.toStringAsFixed(2)},'
+        'faultLabel:${data.faultLabel},'
+        'status:$status';
+
+    setState(() {
+      _hasReceivedData = true;
+      _telemetryData = data;
+      _lastRawData = rawData;
+
+      _chartIndex++;
+
+      _voltagePoints.add(FlSpot(_chartIndex, data.voltage));
+      _groundTruthSocPoints.add(FlSpot(_chartIndex, data.groundTruthSoc));
+
+      if (_voltagePoints.length > 20) {
+        _voltagePoints.removeAt(0);
+      }
+
+      if (_groundTruthSocPoints.length > 20) {
+        _groundTruthSocPoints.removeAt(0);
+      }
+    });
+
+    if (_isLogging) {
+      await _loggingService.writeWarnings(data, warnings);
+    }
+  }
+
+  String _getStatusText(List<String> warnings) {
+    if (!_hasReceivedData) {
+      return 'BEKLENİYOR';
+    }
+
+    if (warnings.isNotEmpty) {
+      return 'WARNING';
+    }
+
+    return 'OK';
+  }
+
+  List<String> _generateWarnings(TelemetryData data) {
+    final List<String> warnings = [];
+
+    if (!_hasReceivedData) {
+      return warnings;
+    }
+
+    if (data.voltage < 3.0) {
+      warnings.add('Batarya gerilimi dusuk');
+    }
+
+    if (data.voltage > 4.2) {
+      warnings.add('Batarya gerilimi yuksek');
+    }
+
+    if (data.current.abs() > 40) {
+      warnings.add('Akim degeri yuksek');
+    }
+
+    if (data.temperature > 35) {
+      warnings.add('Sicaklik yuksek');
+    }
+
+    if (data.motorSpeedRpm > 5000) {
+      warnings.add('Motor hizi yuksek');
+    }
+
+    if (data.estimatedSoc < 20) {
+      warnings.add('Tahmini SOC dusuk');
+    }
+
+    if (data.residual.abs() > 2.5) {
+      warnings.add('SOC tahmin hatasi yuksek');
+    }
+
+    return warnings;
   }
 
   void _toggleSerialConnection() {
@@ -126,7 +231,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
     final success = _serialService.connect(
       portName: _selectedPort!,
       baudRate: 9600,
-      onDataReceived: _handleIncomingData,
+      onDataReceived: _handleIncomingRawData,
     );
 
     setState(() {
@@ -141,7 +246,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
 
     setState(() {
       _isSerialConnected = false;
-      _connectionStatus = 'Bağlantı kesildi';
+      _connectionStatus = 'COM bağlantısı kesildi';
     });
   }
 
@@ -158,20 +263,30 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
       _disconnectSerial();
     }
 
-    _simulationService.startSimulation(_handleIncomingData);
+    if (!_isCsvLoaded) {
+      setState(() {
+        _connectionStatus = 'Önce veri seti yüklenmeli';
+      });
+      return;
+    }
+
+    _csvSimulator.start(
+      onData: _handleIncomingData,
+      interval: const Duration(milliseconds: 500),
+    );
 
     setState(() {
       _isSimulationRunning = true;
-      _connectionStatus = 'Simülasyon çalışıyor';
+      _connectionStatus = 'Veri seti simülasyonu çalışıyor';
     });
   }
 
   void _stopSimulation() {
-    _simulationService.stopSimulation();
+    _csvSimulator.stop();
 
     setState(() {
       _isSimulationRunning = false;
-      _connectionStatus = 'Simülasyon durduruldu';
+      _connectionStatus = 'Veri seti simülasyonu durduruldu';
     });
   }
 
@@ -221,7 +336,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
 
   @override
   void dispose() {
-    _simulationService.stopSimulation();
+    _csvSimulator.stop();
     _serialService.disconnect();
     _loggingService.stopLogging();
     super.dispose();
@@ -229,11 +344,16 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
 
   @override
   Widget build(BuildContext context) {
-    final statusColor = _telemetryData.status == 'OK'
+    final warnings = _generateWarnings(_telemetryData);
+    final statusText = _getStatusText(warnings);
+
+    final statusColor = statusText == 'OK'
         ? Colors.greenAccent
-        : _telemetryData.status == 'WARNING'
+        : statusText == 'WARNING'
             ? Colors.orangeAccent
-            : Colors.redAccent;
+            : statusText == 'BEKLENİYOR'
+                ? Colors.white70
+                : Colors.redAccent;
 
     return Scaffold(
       appBar: AppBar(
@@ -252,7 +372,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
             ),
             SizedBox(height: 4),
             Text(
-              'Elektrikli Araç Kontrol ve Gerçek Zamanlı İzleme Paneli',
+              'Elektrikli Araç Kontrol ve Veri Seti Tabanlı İzleme Paneli',
               style: TextStyle(
                 fontSize: 13,
                 color: Colors.white70,
@@ -278,29 +398,37 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
                     Column(
                       children: [
                         SizedBox(
-                          height: 360,
+                          height: 500,
                           child: _buildDataGrid(),
                         ),
                         const SizedBox(height: 12),
                         SizedBox(
                           height: 360,
-                          child: _buildStatusAndWarningArea(statusColor),
+                          child: _buildStatusAndWarningArea(
+                            statusText: statusText,
+                            statusColor: statusColor,
+                            warnings: warnings,
+                          ),
                         ),
                       ],
                     )
                   else
                     SizedBox(
-                      height: shortScreen ? 360 : 390,
+                      height: shortScreen ? 390 : 430,
                       child: Row(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           SizedBox(
-                            width: 500,
+                            width: 560,
                             child: _buildDataGrid(),
                           ),
                           const SizedBox(width: 12),
                           Expanded(
-                            child: _buildStatusAndWarningArea(statusColor),
+                            child: _buildStatusAndWarningArea(
+                              statusText: statusText,
+                              statusColor: statusColor,
+                              warnings: warnings,
+                            ),
                           ),
                         ],
                       ),
@@ -362,6 +490,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
             text: _isSerialConnected ? 'Bağlantıyı Kes' : 'Bağlan',
             onPressed: _toggleSerialConnection,
           ),
+        
           _smallButton(
             text: _isSimulationRunning
                 ? 'Simülasyonu Durdur'
@@ -384,12 +513,23 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
   }
 
   Widget _connectionChip() {
-    final bool active = _isSimulationRunning || _isSerialConnected;
+    Color indicatorColor;
+    Color backgroundColor;
+    Color borderColor;
 
-    final Color indicatorColor = active ? Colors.greenAccent : Colors.redAccent;
-    final Color backgroundColor =
-        active ? Colors.green.withOpacity(0.15) : Colors.red.withOpacity(0.15);
-    final Color borderColor = active ? Colors.green : Colors.red;
+    if (_isSimulationRunning || _isSerialConnected) {
+      indicatorColor = Colors.greenAccent;
+      backgroundColor = Colors.green.withValues(alpha: 0.15);
+      borderColor = Colors.green;
+    } else if (_isCsvLoaded) {
+      indicatorColor = Colors.blueAccent;
+      backgroundColor = Colors.blue.withValues(alpha: 0.15);
+      borderColor = Colors.blue;
+    } else {
+      indicatorColor = Colors.redAccent;
+      backgroundColor = Colors.red.withValues(alpha: 0.15);
+      borderColor = Colors.red;
+    }
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -430,7 +570,10 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
       height: 36,
       child: ElevatedButton(
         onPressed: onPressed,
-        child: Text(text),
+        child: Text(
+          text,
+          overflow: TextOverflow.ellipsis,
+        ),
       ),
     );
   }
@@ -443,32 +586,8 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
             children: [
               Expanded(
                 child: _buildDataCard(
-                  title: 'Araç Hızı',
-                  value: '${_telemetryData.speed.toStringAsFixed(0)}',
-                  unit: 'km/h',
-                  icon: Icons.speed,
-                ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: _buildDataCard(
-                  title: 'Batarya',
-                  value: '%${_telemetryData.soc.toStringAsFixed(0)}',
-                  unit: 'SOC',
-                  icon: Icons.battery_charging_full,
-                ),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 10),
-        Expanded(
-          child: Row(
-            children: [
-              Expanded(
-                child: _buildDataCard(
                   title: 'Gerilim',
-                  value: '${_telemetryData.voltage.toStringAsFixed(0)}',
+                  value: _telemetryData.voltage.toStringAsFixed(2),
                   unit: 'V',
                   icon: Icons.bolt,
                 ),
@@ -477,7 +596,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
               Expanded(
                 child: _buildDataCard(
                   title: 'Akım',
-                  value: '${_telemetryData.current.toStringAsFixed(1)}',
+                  value: _telemetryData.current.toStringAsFixed(2),
                   unit: 'A',
                   icon: Icons.electric_meter,
                 ),
@@ -491,8 +610,8 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
             children: [
               Expanded(
                 child: _buildDataCard(
-                  title: 'Batarya Sıcaklığı',
-                  value: '${_telemetryData.batteryTemp.toStringAsFixed(0)}',
+                  title: 'Sıcaklık',
+                  value: _telemetryData.temperature.toStringAsFixed(2),
                   unit: '°C',
                   icon: Icons.thermostat,
                 ),
@@ -500,10 +619,59 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
               const SizedBox(width: 10),
               Expanded(
                 child: _buildDataCard(
-                  title: 'Motor Sıcaklığı',
-                  value: '${_telemetryData.motorTemp.toStringAsFixed(0)}',
-                  unit: '°C',
-                  icon: Icons.device_thermostat,
+                  title: 'Motor Hızı',
+                  value: _telemetryData.motorSpeedRpm.toStringAsFixed(0),
+                  unit: 'RPM',
+                  icon: Icons.rotate_right,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 10),
+        Expanded(
+          child: Row(
+            children: [
+              Expanded(
+                child: _buildDataCard(
+                  title: 'Tahmini SOC',
+                  value: '%${_telemetryData.estimatedSoc.toStringAsFixed(1)}',
+                  unit: '',
+                  icon: Icons.battery_charging_full,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: _buildDataCard(
+                  title: 'Gerçek SOC',
+                  value:
+                      '%${_telemetryData.groundTruthSoc.toStringAsFixed(1)}',
+                  unit: '',
+                  icon: Icons.battery_full,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 10),
+        Expanded(
+          child: Row(
+            children: [
+              Expanded(
+                child: _buildDataCard(
+                  title: 'Residual',
+                  value: _telemetryData.residual.toStringAsFixed(2),
+                  unit: '%',
+                  icon: Icons.compare_arrows,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: _buildDataCard(
+                  title: 'Fault Label',
+                  value: _telemetryData.faultLabel,
+                  unit: '',
+                  icon: Icons.label_important,
                 ),
               ),
             ],
@@ -546,24 +714,30 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
                 Row(
                   crossAxisAlignment: CrossAxisAlignment.end,
                   children: [
-                    Text(
-                      value,
-                      style: const TextStyle(
-                        fontSize: 27,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    const SizedBox(width: 5),
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 4),
+                    Flexible(
                       child: Text(
-                        unit,
+                        value,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
-                          fontSize: 13,
-                          color: Colors.white60,
+                          fontSize: 27,
+                          fontWeight: FontWeight.bold,
                         ),
                       ),
                     ),
+                    if (unit.isNotEmpty) ...[
+                      const SizedBox(width: 5),
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 4),
+                        child: Text(
+                          unit,
+                          style: const TextStyle(
+                            fontSize: 13,
+                            color: Colors.white60,
+                          ),
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ],
@@ -574,13 +748,20 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
     );
   }
 
-  Widget _buildStatusAndWarningArea(Color statusColor) {
+  Widget _buildStatusAndWarningArea({
+    required String statusText,
+    required Color statusColor,
+    required List<String> warnings,
+  }) {
     return Column(
       children: [
-        _buildStatusPanel(statusColor),
+        _buildStatusPanel(
+          statusText: statusText,
+          statusColor: statusColor,
+        ),
         const SizedBox(height: 8),
         Expanded(
-          child: _buildWarningsPanel(),
+          child: _buildWarningsPanel(warnings),
         ),
         const SizedBox(height: 8),
         _buildRawDataPanel(),
@@ -588,12 +769,17 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
     );
   }
 
-  Widget _buildStatusPanel(Color statusColor) {
-    final sourceText = _isSimulationRunning
-        ? 'Simülasyon'
-        : _isSerialConnected
-            ? _selectedPort ?? 'COM'
-            : 'Bekleniyor';
+  Widget _buildStatusPanel({
+    required String statusText,
+    required Color statusColor,
+  }) {
+    final sourceText = _isSerialConnected
+        ? _selectedPort ?? 'COM Port'
+        : _isSimulationRunning
+            ? 'CSV Veri Seti'
+            : _isCsvLoaded
+                ? 'Veri Seti Hazır'
+                : 'Bekleniyor';
 
     final lastPacketTime =
         '${_telemetryData.timestamp.hour.toString().padLeft(2, '0')}:'
@@ -609,7 +795,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
           Expanded(
             child: _statusInfoItem(
               title: 'Sistem Durumu',
-              value: _telemetryData.status,
+              value: statusText,
               valueColor: statusColor,
               icon: Icons.monitor_heart_outlined,
             ),
@@ -629,7 +815,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
               title: 'Veri Kaynağı',
               value: sourceText,
               valueColor: Colors.white,
-              icon: Icons.settings_input_antenna,
+              icon: Icons.dataset_outlined,
             ),
           ),
         ],
@@ -680,9 +866,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
     );
   }
 
-  Widget _buildWarningsPanel() {
-    final warnings = _telemetryData.warnings;
-
+  Widget _buildWarningsPanel(List<String> warnings) {
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(16),
@@ -712,8 +896,8 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
                 ),
                 decoration: BoxDecoration(
                   color: warnings.isEmpty
-                      ? Colors.green.withOpacity(0.15)
-                      : Colors.orange.withOpacity(0.15),
+                      ? Colors.green.withValues(alpha: 0.15)
+                      : Colors.orange.withValues(alpha: 0.15),
                   borderRadius: BorderRadius.circular(18),
                 ),
                 child: Text(
@@ -745,10 +929,10 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
                     margin: const EdgeInsets.only(bottom: 8),
                     padding: const EdgeInsets.all(10),
                     decoration: BoxDecoration(
-                      color: Colors.orange.withOpacity(0.12),
+                      color: Colors.orange.withValues(alpha: 0.12),
                       borderRadius: BorderRadius.circular(12),
                       border: Border.all(
-                        color: Colors.orange.withOpacity(0.35),
+                        color: Colors.orange.withValues(alpha: 0.35),
                       ),
                     ),
                     child: Text(
@@ -811,17 +995,17 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
       children: [
         Expanded(
           child: _buildLineChartCard(
-            title: 'Araç Hızı Grafiği',
-            spots: _speedPoints,
-            maxY: 120,
-            unit: 'km/h',
+            title: 'Gerilim Grafiği',
+            spots: _voltagePoints,
+            maxY: 5,
+            unit: 'V',
           ),
         ),
         const SizedBox(width: 12),
         Expanded(
           child: _buildLineChartCard(
-            title: 'Batarya Doluluğu Grafiği',
-            spots: _socPoints,
+            title: 'Gerçek SOC Grafiği',
+            spots: _groundTruthSocPoints,
             maxY: 100,
             unit: '%',
           ),
@@ -908,7 +1092,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
       border: Border.all(color: Colors.white12),
       boxShadow: [
         BoxShadow(
-          color: Colors.black.withOpacity(0.22),
+          color: Colors.black.withValues(alpha: 0.22),
           blurRadius: 8,
           offset: const Offset(0, 3),
         ),

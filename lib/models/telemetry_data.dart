@@ -1,37 +1,44 @@
 class TelemetryData {
-  final double speed;
-  final double soc;
+  final DateTime timestamp;
+
+  final double timeMs;
   final double voltage;
   final double current;
-  final double batteryTemp;
-  final double motorTemp;
-  final String status;
-  final DateTime timestamp;
-  final List<String> warnings;
+  final double temperature;
+  final double motorSpeedRpm;
+  final String hallCode;
+  final double estimatedSoc;
+  final double groundTruthSoc;
+  final double residual;
+  final String faultLabel;
 
   TelemetryData({
-    required this.speed,
-    required this.soc,
+    required this.timestamp,
+    required this.timeMs,
     required this.voltage,
     required this.current,
-    required this.batteryTemp,
-    required this.motorTemp,
-    required this.status,
-    required this.timestamp,
-    required this.warnings,
+    required this.temperature,
+    required this.motorSpeedRpm,
+    required this.hallCode,
+    required this.estimatedSoc,
+    required this.groundTruthSoc,
+    required this.residual,
+    required this.faultLabel,
   });
 
   factory TelemetryData.empty() {
     return TelemetryData(
-      speed: 0,
-      soc: 0,
+      timestamp: DateTime.now(),
+      timeMs: 0,
       voltage: 0,
       current: 0,
-      batteryTemp: 0,
-      motorTemp: 0,
-      status: 'BEKLENİYOR',
-      timestamp: DateTime.now(),
-      warnings: const [],
+      temperature: 0,
+      motorSpeedRpm: 0,
+      hallCode: '-',
+      estimatedSoc: 0,
+      groundTruthSoc: 0,
+      residual: 0,
+      faultLabel: 'Normal',
     );
   }
 }

@@ -9,7 +9,7 @@ class SerialService {
   SerialPortReader? _reader;
   StreamSubscription<Uint8List>? _subscription;
 
-  String _buffer = '';
+  final StringBuffer _buffer = StringBuffer();
 
   List<String> getAvailablePorts() {
     return SerialPort.availablePorts;
@@ -17,37 +17,49 @@ class SerialService {
 
   bool connect({
     required String portName,
-    required Function(String rawData) onDataReceived,
+    required void Function(String rawData) onDataReceived,
     int baudRate = 9600,
   }) {
     try {
+      disconnect();
+
       _port = SerialPort(portName);
 
       if (!_port!.openReadWrite()) {
         return false;
       }
 
-      final config = SerialPortConfig();
-      config.baudRate = baudRate;
-      config.bits = 8;
-      config.stopBits = 1;
-      config.parity = SerialPortParity.none;
+      final config = SerialPortConfig()
+        ..baudRate = baudRate
+        ..bits = 8
+        ..stopBits = 1
+        ..parity = SerialPortParity.none;
+
       _port!.config = config;
 
       _reader = SerialPortReader(_port!);
 
       _subscription = _reader!.stream.listen((data) {
         final incomingText = utf8.decode(data, allowMalformed: true);
-        _buffer += incomingText;
 
-        while (_buffer.contains('\n')) {
-          final index = _buffer.indexOf('\n');
-          final line = _buffer.substring(0, index).trim();
-          _buffer = _buffer.substring(index + 1);
+        _buffer.write(incomingText);
 
-          if (line.isNotEmpty) {
-            onDataReceived(line);
+        final bufferText = _buffer.toString();
+
+        if (bufferText.contains('\n')) {
+          final lines = bufferText.split('\n');
+
+          for (int i = 0; i < lines.length - 1; i++) {
+            final line = lines[i].trim();
+
+            if (line.isNotEmpty) {
+              onDataReceived(line);
+            }
           }
+
+          _buffer
+            ..clear()
+            ..write(lines.last);
         }
       });
 
@@ -69,7 +81,9 @@ class SerialService {
       _port!.close();
     }
 
+    _port?.dispose();
     _port = null;
-    _buffer = '';
+
+    _buffer.clear();
   }
 }

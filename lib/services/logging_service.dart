@@ -3,7 +3,7 @@ import 'dart:io';
 import '../models/telemetry_data.dart';
 
 class LoggingService {
-  File? _logFile;
+  File? _warningLogFile;
   bool _isLogging = false;
 
   bool get isLogging => _isLogging;
@@ -25,49 +25,60 @@ class LoggingService {
 
     final now = DateTime.now();
 
-    final fileName =
-        'aks_telemetri_${now.year}_${now.month.toString().padLeft(2, '0')}_${now.day.toString().padLeft(2, '0')}_'
-        '${now.hour.toString().padLeft(2, '0')}_${now.minute.toString().padLeft(2, '0')}_${now.second.toString().padLeft(2, '0')}.csv';
+    final datePart =
+        '${now.year}_${now.month.toString().padLeft(2, '0')}_${now.day.toString().padLeft(2, '0')}_'
+        '${now.hour.toString().padLeft(2, '0')}_${now.minute.toString().padLeft(2, '0')}_${now.second.toString().padLeft(2, '0')}';
 
-    _logFile = File('${logDirectory.path}\\$fileName');
+    final warningFileName = 'aks_uyari_kaydi_$datePart.csv';
 
-    await _logFile!.writeAsString(
-      'sep=;\n'
-      'timestamp;speed_kmh;soc_percent;voltage_v;current_ampere;battery_temp_c;motor_temp_c;status\n',
-    );
+    _warningLogFile = File('${logDirectory.path}\\$warningFileName');
+
+    await _warningLogFile!.writeAsString(
+  '\uFEFFsep=;\n'
+  'timestamp;time_ms;warning_message;voltage_v;current_a;temperature_c;motor_speed_rpm;estimated_soc_percent;ground_truth_soc_percent;residual_percent;hall_code;fault_label\n',
+);
 
     _isLogging = true;
 
-    return _logFile!.path;
+    return _warningLogFile!.path;
   }
 
   Future<void> stopLogging() async {
     _isLogging = false;
-    _logFile = null;
+    _warningLogFile = null;
   }
 
-  Future<void> writeData(TelemetryData data) async {
-    if (!_isLogging || _logFile == null) {
+  Future<void> writeWarnings(
+    TelemetryData data,
+    List<String> warnings,
+  ) async {
+    if (!_isLogging || _warningLogFile == null || warnings.isEmpty) {
       return;
     }
 
     final timestamp = _formatDateTime(data.timestamp);
 
-    final line =
-        '$timestamp;'
-        '${data.speed.toStringAsFixed(0)};'
-        '${data.soc.toStringAsFixed(0)};'
-        '${data.voltage.toStringAsFixed(0)};'
-        '${_formatDecimal(data.current, 1)};'
-        '${data.batteryTemp.toStringAsFixed(0)};'
-        '${data.motorTemp.toStringAsFixed(0)};'
-        '${data.status}\n';
+    for (final warning in warnings) {
+      final line =
+          '$timestamp;'
+          '${_formatDecimal(data.timeMs, 0)};'
+          '$warning;'
+          '${_formatDecimal(data.voltage, 2)};'
+          '${_formatDecimal(data.current, 2)};'
+          '${_formatDecimal(data.temperature, 2)};'
+          '${_formatDecimal(data.motorSpeedRpm, 0)};'
+          '${_formatDecimal(data.estimatedSoc, 2)};'
+          '${_formatDecimal(data.groundTruthSoc, 2)};'
+          '${_formatDecimal(data.residual, 2)};'
+          '${data.hallCode};'
+          '${data.faultLabel}\n';
 
-    await _logFile!.writeAsString(
-      line,
-      mode: FileMode.append,
-      flush: true,
-    );
+      await _warningLogFile!.writeAsString(
+        line,
+        mode: FileMode.append,
+        flush: true,
+      );
+    }
   }
 
   String _formatDecimal(double value, int fractionDigits) {
