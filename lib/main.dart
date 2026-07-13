@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
@@ -19,6 +20,26 @@ enum SensorLevel {
   normal,
   critical,
   risky,
+}
+
+class ExpectedDecisionResults {
+  final String firstLabel;
+  final String firstValue;
+
+  final String secondLabel;
+  final String secondValue;
+
+  final String thirdLabel;
+  final String thirdValue;
+
+  const ExpectedDecisionResults({
+    required this.firstLabel,
+    required this.firstValue,
+    required this.secondLabel,
+    required this.secondValue,
+    required this.thirdLabel,
+    required this.thirdValue,
+  });
 }
 
 Color getLevelColor(SensorLevel level) {
@@ -87,14 +108,19 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
 
   final List<FlSpot> _voltagePoints = [];
   final List<FlSpot> _groundTruthSocPoints = [];
-  double _chartIndex = 0;
+  final List<FlSpot> _speedPoints = [];
+  final List<FlSpot> _temperaturePoints = [];
 
+  double _chartIndex = 0;
   double _totalEnergyKwh = 0.0;
 
   static const int _seriesCellCount = 96;
   static const double _batteryCapacityKwh = 5.0;
   static const double _averageConsumptionKwhPer100Km = 15.0;
-  static const double _sampleIntervalHours = 0.5 / 3600;
+  static const double _sampleIntervalHours = 1 / 3600;
+
+  static const double _wheelRadiusMeter = 0.30;
+  static const double _gearRatio = 10.0;
 
   @override
   void initState() {
@@ -183,6 +209,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
 
     final instantPowerKw = _calculateInstantPowerKw(data);
     final energyIncrementKwh = instantPowerKw * _sampleIntervalHours;
+    final speedKmh = _calculateVehicleSpeedKmh(data);
 
     setState(() {
       _hasReceivedData = true;
@@ -194,7 +221,11 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
       _chartIndex++;
 
       _voltagePoints.add(FlSpot(_chartIndex, data.voltage));
-      _groundTruthSocPoints.add(FlSpot(_chartIndex, data.groundTruthSoc));
+      _groundTruthSocPoints.add(
+        FlSpot(_chartIndex, _boundedSoc(data.groundTruthSoc)),
+      );
+      _speedPoints.add(FlSpot(_chartIndex, speedKmh));
+      _temperaturePoints.add(FlSpot(_chartIndex, data.temperature));
 
       if (_voltagePoints.length > 20) {
         _voltagePoints.removeAt(0);
@@ -202,6 +233,14 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
 
       if (_groundTruthSocPoints.length > 20) {
         _groundTruthSocPoints.removeAt(0);
+      }
+
+      if (_speedPoints.length > 20) {
+        _speedPoints.removeAt(0);
+      }
+
+      if (_temperaturePoints.length > 20) {
+        _temperaturePoints.removeAt(0);
       }
     });
 
@@ -220,7 +259,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
     }
 
     if (warnings.isNotEmpty) {
-      return 'WARNING';
+      return 'UYARI';
     }
 
     return 'OK';
@@ -237,6 +276,24 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
   double _calculateInstantPowerKw(TelemetryData data) {
     final packVoltage = _calculatePackVoltage(data);
     return (packVoltage * data.current.abs()) / 1000;
+  }
+
+  double _calculateVehicleSpeedKmh(TelemetryData data) {
+    final wheelRpm = data.motorSpeedRpm / _gearRatio;
+    final wheelCircumferenceMeter = 2 * math.pi * _wheelRadiusMeter;
+
+    return wheelRpm * wheelCircumferenceMeter * 60 / 1000;
+  }
+
+  double _calculateEfficiencyWhPerKm(TelemetryData data) {
+    final speedKmh = _calculateVehicleSpeedKmh(data);
+
+    if (speedKmh <= 1) {
+      return 0;
+    }
+
+    final instantPowerW = _calculateInstantPowerKw(data) * 1000;
+    return instantPowerW / speedKmh;
   }
 
   double _calculateRemainingEnergyKwh(TelemetryData data) {
@@ -321,6 +378,94 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
     return SensorLevel.normal;
   }
 
+  int _calculateVehicleHealthScore() {
+    if (!_hasReceivedData) {
+      return 0;
+    }
+
+    double riskPenalty = 0;
+
+    riskPenalty += _getRiskPenalty(
+      level: _getMotorSpeedLevel(_telemetryData.motorSpeedRpm),
+      weight: 35,
+    );
+
+    riskPenalty += _getRiskPenalty(
+      level: _getCurrentLevel(_telemetryData.current),
+      weight: 30,
+    );
+
+    riskPenalty += _getRiskPenalty(
+      level: _getTemperatureLevel(_telemetryData.temperature),
+      weight: 20,
+    );
+
+    riskPenalty += _getRiskPenalty(
+      level: _getVoltageLevel(_telemetryData.voltage),
+      weight: 10,
+    );
+
+    riskPenalty += _getRiskPenalty(
+      level: _getSocLevel(_telemetryData.groundTruthSoc),
+      weight: 5,
+    );
+
+    if (_isDataTimeout) {
+      riskPenalty += 20;
+    }
+
+    final score = 100 - riskPenalty;
+    return score.clamp(0, 100).round();
+  }
+
+  double _getRiskPenalty({
+    required SensorLevel level,
+    required double weight,
+  }) {
+    switch (level) {
+      case SensorLevel.waiting:
+        return 0;
+      case SensorLevel.normal:
+        return 0;
+      case SensorLevel.critical:
+        return weight * 0.45;
+      case SensorLevel.risky:
+        return weight;
+    }
+  }
+
+  String _getVehicleHealthStatus(int score) {
+    if (!_hasReceivedData) {
+      return 'Bekleniyor';
+    }
+
+    if (score >= 75) {
+      return 'Güvenli';
+    }
+
+    if (score >= 50) {
+      return 'Dikkat';
+    }
+
+    return 'Riskli';
+  }
+
+  Color _getVehicleHealthColor(int score) {
+    if (!_hasReceivedData) {
+      return Colors.white70;
+    }
+
+    if (score >= 75) {
+      return const Color(0xFF38BDF8);
+    }
+
+    if (score >= 50) {
+      return Colors.amber;
+    }
+
+    return Colors.redAccent;
+  }
+
   List<String> _generateWarnings(TelemetryData data) {
     final List<String> warnings = [];
 
@@ -371,6 +516,214 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
 
     return warnings;
   }
+
+String _getSmartDecisionRecommendation(List<String> warnings) {
+  if (!_hasReceivedData) {
+    return 'Veri bekleniyor. Sistem değerlendirmesi için telemetri akışı başlatılmalıdır.';
+  }
+
+  if (_isDataTimeout) {
+    return 'Veri akışı kesildi. COM bağlantısı, LoRa haberleşmesi veya simülasyon durumu kontrol edilmelidir.';
+  }
+
+  if (warnings.isEmpty) {
+    return 'Batarya ve araç parametreleri güvenli bölgede. Normal sürüşe devam edebilirsiniz.';
+  }
+
+  final warningText = warnings.join(' ').toLowerCase();
+  final List<String> recommendations = [];
+
+  if (warningText.contains('riskli akim')) {
+    recommendations.add(
+      'Akımı yaklaşık %18 azaltmak için ani hızlanmadan kaçının ve sürüş yükünü düşürün.',
+    );
+  } else if (warningText.contains('kritik akim')) {
+    recommendations.add(
+      'Akımı yaklaşık %12 azaltmak için sürüş yükünü kontrollü şekilde düşürün.',
+    );
+  }
+
+  if (warningText.contains('riskli motor hizi')) {
+    recommendations.add(
+      'Motor hızını yaklaşık %15 düşürün ve yüksek devirli kullanımdan kaçının.',
+    );
+  } else if (warningText.contains('kritik motor hizi')) {
+    recommendations.add(
+      'Motor hızını yaklaşık %10 düşürün ve motor yükünü azaltın.',
+    );
+  }
+
+  if (warningText.contains('riskli sicaklik')) {
+    recommendations.add(
+      'Sıcaklığı düşürmek için aracı güvenli noktaya alın ve sistemi soğumaya bırakın.',
+    );
+  } else if (warningText.contains('kritik sicaklik')) {
+    recommendations.add(
+      'Sıcaklığı yaklaşık %8 azaltmak için hızı düşürün ve termal durumu takip edin.',
+    );
+  }
+
+  if (warningText.contains('riskli gerilim')) {
+    recommendations.add(
+      'Gerilim seviyesi güvenli aralık dışında. Batarya bağlantısı ve hücre gerilimini kontrol edin.',
+    );
+  } else if (warningText.contains('kritik gerilim')) {
+    recommendations.add(
+      'Gerilim dengesini korumak için batarya yükünü azaltın ve yüksek güç tüketiminden kaçının.',
+    );
+  }
+
+  if (warningText.contains('riskli soc')) {
+    recommendations.add(
+      'SOC seviyesi riskli bölgede. Enerji tüketimini azaltın ve kalan menzili kontrol edin.',
+    );
+  } else if (warningText.contains('kritik soc')) {
+    recommendations.add(
+      'Batarya seviyesini korumak için enerji tüketimini yaklaşık %10 azaltın.',
+    );
+  }
+
+  if (recommendations.isEmpty) {
+    return 'Sistemde uyarı algılandı. İlgili araç parametrelerini düşürerek kontrollü sürüşe devam ediniz.';
+  }
+
+  return recommendations.join(' ');
+}
+
+  List<String> _getDecisionReasons(List<String> warnings) {
+    if (!_hasReceivedData) {
+      return ['Telemetri verisi bekleniyor.'];
+    }
+
+    if (_isDataTimeout) {
+      return ['Telemetri veri akışı kesildi.'];
+    }
+
+    if (warnings.isEmpty) {
+      return ['Tüm parametreler güvenli çalışma aralığında.'];
+    }
+
+    return warnings.take(2).toList();
+  }
+
+  ExpectedDecisionResults _getExpectedResults(List<String> warnings) {
+  if (!_hasReceivedData) {
+    return const ExpectedDecisionResults(
+      firstLabel: 'Veri',
+      firstValue: '-',
+      secondLabel: 'Sistem',
+      secondValue: '-',
+      thirdLabel: 'Sağlık skoru',
+      thirdValue: '-',
+    );
+  }
+
+  if (_isDataTimeout) {
+    return const ExpectedDecisionResults(
+      firstLabel: 'Veri akışı',
+      firstValue: 'Kontrol',
+      secondLabel: 'Bağlantı',
+      secondValue: 'Yenile',
+      thirdLabel: 'Sağlık skoru',
+      thirdValue: '↓ %20',
+    );
+  }
+
+  if (warnings.isEmpty) {
+    return const ExpectedDecisionResults(
+      firstLabel: 'Enerji tüketimi',
+      firstValue: 'Normal',
+      secondLabel: 'Motor yükü',
+      secondValue: 'Normal',
+      thirdLabel: 'Sağlık skoru',
+      thirdValue: 'Korunur',
+    );
+  }
+
+  final warningText = warnings.join(' ').toLowerCase();
+  final currentHealth = _calculateVehicleHealthScore();
+
+  final int healthIncrease = warningText.contains('riskli') ? 12 : 7;
+  final improvedHealth = (currentHealth + healthIncrease).clamp(0, 100).round();
+
+  final List<Map<String, String>> expectedItems = [];
+
+  if (warningText.contains('riskli akim')) {
+    expectedItems.add({
+      'label': 'Akım seviyesi',
+      'value': '↓ %18',
+    });
+  } else if (warningText.contains('kritik akim')) {
+    expectedItems.add({
+      'label': 'Akım seviyesi',
+      'value': '↓ %12',
+    });
+  }
+
+  if (warningText.contains('riskli motor hizi')) {
+    expectedItems.add({
+      'label': 'Motor hızı',
+      'value': '↓ %15',
+    });
+  } else if (warningText.contains('kritik motor hizi')) {
+    expectedItems.add({
+      'label': 'Motor hızı',
+      'value': '↓ %10',
+    });
+  }
+
+  if (warningText.contains('riskli sicaklik')) {
+    expectedItems.add({
+      'label': 'Sıcaklık',
+      'value': '↓ %12',
+    });
+  } else if (warningText.contains('kritik sicaklik')) {
+    expectedItems.add({
+      'label': 'Sıcaklık',
+      'value': '↓ %8',
+    });
+  }
+
+  if (warningText.contains('riskli gerilim')) {
+    expectedItems.add({
+      'label': 'Gerilim',
+      'value': 'Kontrol',
+    });
+  } else if (warningText.contains('kritik gerilim')) {
+    expectedItems.add({
+      'label': 'Batarya yükü',
+      'value': '↓ %8',
+    });
+  }
+
+  if (warningText.contains('riskli soc')) {
+    expectedItems.add({
+      'label': 'Enerji tüketimi',
+      'value': '↓ %15',
+    });
+  } else if (warningText.contains('kritik soc')) {
+    expectedItems.add({
+      'label': 'Enerji tüketimi',
+      'value': '↓ %10',
+    });
+  }
+
+  while (expectedItems.length < 2) {
+    expectedItems.add({
+      'label': 'Risk seviyesi',
+      'value': 'Azalır',
+    });
+  }
+
+  return ExpectedDecisionResults(
+    firstLabel: expectedItems[0]['label']!,
+    firstValue: expectedItems[0]['value']!,
+    secondLabel: expectedItems[1]['label']!,
+    secondValue: expectedItems[1]['value']!,
+    thirdLabel: 'Sağlık skoru',
+    thirdValue: '$currentHealth → $improvedHealth',
+  );
+}
 
   SensorLevel _getOverallWarningLevel() {
     if (!_hasReceivedData) return SensorLevel.waiting;
@@ -538,7 +891,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
 
     _csvSimulator.start(
       onData: _handleIncomingData,
-      interval: const Duration(milliseconds: 500),
+      interval: const Duration(seconds: 1),
     );
 
     setState(() {
@@ -641,24 +994,27 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
 
             return SingleChildScrollView(
               child: Padding(
-                padding: const EdgeInsets.all(16),
+                padding: const EdgeInsets.all(14),
                 child: Column(
                   children: [
                     _buildHeaderBar(),
-                    const SizedBox(height: 14),
+                    const SizedBox(height: 10),
+                    _buildTopStatusRow(
+                      statusText: statusText,
+                      statusColor: statusColor,
+                    ),
+                    const SizedBox(height: 12),
                     if (narrowScreen)
                       Column(
                         children: [
                           SizedBox(
-                            height: 440,
-                            child: _buildDataGrid(),
+                            height: 660,
+                            child: _buildLeftDashboardColumn(),
                           ),
-                          const SizedBox(height: 14),
+                          const SizedBox(height: 12),
                           SizedBox(
-                            height: 360,
-                            child: _buildStatusAndWarningArea(
-                              statusText: statusText,
-                              statusColor: statusColor,
+                            height: 660,
+                            child: _buildRightDashboardColumn(
                               warnings: warnings,
                             ),
                           ),
@@ -666,30 +1022,27 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
                       )
                     else
                       SizedBox(
-                        height: shortScreen ? 350 : 380,
+                        height: shortScreen ? 660 : 700,
                         child: Row(
-                          crossAxisAlignment: CrossAxisAlignment.start,
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
-                            SizedBox(
-                              width: 620,
-                              child: _buildDataGrid(),
-                            ),
-                            const SizedBox(width: 14),
                             Expanded(
-                              child: _buildStatusAndWarningArea(
-                                statusText: statusText,
-                                statusColor: statusColor,
+                              flex: 10,
+                              child: _buildLeftDashboardColumn(),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              flex: 12,
+                              child: _buildRightDashboardColumn(
                                 warnings: warnings,
                               ),
                             ),
                           ],
                         ),
                       ),
-                    const SizedBox(height: 14),
-                    _buildEnergyRangePanel(),
-                    const SizedBox(height: 14),
+                    const SizedBox(height: 12),
                     SizedBox(
-                      height: shortScreen ? 240 : 280,
+                      height: shortScreen ? 500 : 560,
                       child: _buildChartsPanel(),
                     ),
                   ],
@@ -702,24 +1055,130 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
     );
   }
 
+  Widget _buildLeftDashboardColumn() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Expanded(
+          flex: 7,
+          child: _buildDataGrid(),
+        ),
+        const SizedBox(height: 12),
+        Expanded(
+          flex: 3,
+          child: _buildEnergyRangePanel(),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildRightDashboardColumn({
+    required List<String> warnings,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Expanded(
+          flex: 3,
+          child: _buildWarningsPanel(warnings),
+        ),
+        const SizedBox(height: 10),
+        Expanded(
+          flex: 4,
+          child: _buildSmartDecisionSupportPanel(warnings),
+        ),
+        const SizedBox(height: 10),
+        Expanded(
+          flex: 3,
+          child: _buildVehicleHealthPanel(),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildTopStatusRow({
+    required String statusText,
+    required Color statusColor,
+  }) {
+    final sourceText = _isSerialConnected
+        ? _selectedPort ?? 'COM Port'
+        : _isSimulationRunning
+            ? 'CSV Veri Seti'
+            : _isCsvLoaded
+                ? 'Veri Seti Hazır'
+                : 'Bekleniyor';
+
+    final lastPacketTime = !_hasReceivedData
+        ? '--:--:--'
+        : '${_telemetryData.timestamp.hour.toString().padLeft(2, '0')}:'
+            '${_telemetryData.timestamp.minute.toString().padLeft(2, '0')}:'
+            '${_telemetryData.timestamp.second.toString().padLeft(2, '0')}';
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: _panelDecoration(),
+      child: Row(
+        children: [
+          Expanded(
+            child: _statusInfoItem(
+              title: 'Sistem Durumu',
+              value: statusText,
+              valueColor: statusColor,
+              icon: Icons.monitor_heart_outlined,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: _statusInfoItem(
+              title: 'Bağlantı',
+              value: _getConnectionText(),
+              valueColor: _getConnectionColor(),
+              icon: _getConnectionIcon(),
+              iconColor: _getConnectionColor(),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: _statusInfoItem(
+              title: 'Son Paket',
+              value: lastPacketTime,
+              valueColor: Colors.white,
+              icon: Icons.access_time,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: _statusInfoItem(
+              title: 'Veri Kaynağı',
+              value: sourceText,
+              valueColor: Colors.white,
+              icon: Icons.dataset_outlined,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildHeaderBar() {
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       decoration: _panelDecoration(),
       child: Row(
         children: [
           Container(
-            width: 46,
-            height: 46,
+            width: 42,
+            height: 42,
             decoration: BoxDecoration(
               color: const Color(0xFF0EA5E9).withValues(alpha: 0.18),
-              borderRadius: BorderRadius.circular(14),
+              borderRadius: BorderRadius.circular(13),
             ),
             child: const Icon(
               Icons.directions_car_filled,
               color: Color(0xFF38BDF8),
-              size: 26,
+              size: 24,
             ),
           ),
           const SizedBox(width: 14),
@@ -730,16 +1189,16 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
                 Text(
                   'AKS Telemetri Paneli',
                   style: TextStyle(
-                    fontSize: 22,
+                    fontSize: 20,
                     fontWeight: FontWeight.bold,
                     color: Colors.white,
                   ),
                 ),
-                SizedBox(height: 3),
+                SizedBox(height: 2),
                 Text(
                   'Elektrikli Araç Kontrol Sistemi • Gerçek Zamanlı Dashboard',
                   style: TextStyle(
-                    fontSize: 13,
+                    fontSize: 12,
                     color: Colors.white54,
                   ),
                 ),
@@ -747,12 +1206,12 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
             ),
           ),
           Wrap(
-            spacing: 10,
-            runSpacing: 10,
+            spacing: 8,
+            runSpacing: 8,
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
               SizedBox(
-                width: 85,
+                width: 80,
                 child: DropdownButton<String>(
                   isExpanded: true,
                   value: _selectedPort,
@@ -799,19 +1258,19 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
 
   Widget _primaryStartButton() {
     return SizedBox(
-      height: 42,
+      height: 38,
       child: ElevatedButton.icon(
         onPressed: _toggleSimulation,
         style: ElevatedButton.styleFrom(
           backgroundColor: const Color(0xFF0EA5E9),
           foregroundColor: Colors.white,
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(14),
+            borderRadius: BorderRadius.circular(13),
           ),
         ),
         icon: Icon(
           _isSimulationRunning ? Icons.stop_circle : Icons.play_circle,
-          size: 18,
+          size: 17,
         ),
         label: Text(
           _isSimulationRunning ? 'Durdur' : 'Başlat',
@@ -845,18 +1304,19 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
     }
 
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+      height: 38,
+      padding: const EdgeInsets.symmetric(horizontal: 11),
       decoration: BoxDecoration(
         color: backgroundColor,
-        borderRadius: BorderRadius.circular(18),
+        borderRadius: BorderRadius.circular(17),
         border: Border.all(color: borderColor.withValues(alpha: 0.8)),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
           Container(
-            width: 9,
-            height: 9,
+            width: 8,
+            height: 8,
             decoration: BoxDecoration(
               color: indicatorColor,
               shape: BoxShape.circle,
@@ -881,10 +1341,10 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
     required VoidCallback? onPressed,
   }) {
     return SizedBox(
-      height: 38,
+      height: 36,
       child: ElevatedButton.icon(
         onPressed: onPressed,
-        icon: Icon(icon, size: 16),
+        icon: Icon(icon, size: 15),
         label: Text(
           text,
           overflow: TextOverflow.ellipsis,
@@ -895,7 +1355,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
           disabledForegroundColor: Colors.white30,
           disabledBackgroundColor: const Color(0xFF0B1020),
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(14),
+            borderRadius: BorderRadius.circular(13),
           ),
         ),
       ),
@@ -923,7 +1383,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
                   level: voltageLevel,
                 ),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: 9),
               Expanded(
                 child: _buildDataCard(
                   title: 'Akım',
@@ -936,7 +1396,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
             ],
           ),
         ),
-        const SizedBox(height: 10),
+        const SizedBox(height: 9),
         Expanded(
           child: Row(
             children: [
@@ -949,7 +1409,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
                   level: temperatureLevel,
                 ),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: 9),
               Expanded(
                 child: _buildDataCard(
                   title: 'Motor Hızı',
@@ -962,11 +1422,12 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
             ],
           ),
         ),
-        const SizedBox(height: 10),
+        const SizedBox(height: 9),
         Expanded(
           child: _buildDataCard(
             title: 'SOC',
-            value: '%${_boundedSoc(_telemetryData.groundTruthSoc).toStringAsFixed(1)}',
+            value:
+                '%${_boundedSoc(_telemetryData.groundTruthSoc).toStringAsFixed(1)}',
             unit: '',
             icon: Icons.battery_full,
             level: socLevel,
@@ -977,168 +1438,76 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
   }
 
   Widget _buildDataCard({
-    required String title,
-    required String value,
-    required String unit,
-    required IconData icon,
-    required SensorLevel level,
-  }) {
-    final levelColor = getLevelColor(level);
+  required String title,
+  required String value,
+  required String unit,
+  required IconData icon,
+  required SensorLevel level,
+}) {
+  final levelColor = getLevelColor(level);
 
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: _panelDecoration(),
-      child: Row(
-        children: [
-          BlinkingStatusIcon(
-            icon: icon,
-            level: level,
-            size: 28,
-          ),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: const TextStyle(
-                    fontSize: 13,
-                    color: Colors.white60,
-                    fontWeight: FontWeight.w600,
-                  ),
+  return Container(
+    padding: const EdgeInsets.symmetric(horizontal: 26, vertical: 18),
+    decoration: _panelDecoration(),
+    child: Row(
+      children: [
+        BlinkingStatusIcon(
+          icon: icon,
+          level: level,
+          size: 32,
+        ),
+        const SizedBox(width: 22),
+        Expanded(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title,
+                style: const TextStyle(
+                  fontSize: 14,
+                  color: Colors.white60,
+                  fontWeight: FontWeight.w700,
                 ),
-                const SizedBox(height: 6),
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: [
-                    Flexible(
+              ),
+              const SizedBox(height: 8),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Flexible(
+                    child: Text(
+                      value,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 28,
+                        fontWeight: FontWeight.bold,
+                        color: levelColor,
+                      ),
+                    ),
+                  ),
+                  if (unit.isNotEmpty) ...[
+                    const SizedBox(width: 8),
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 6),
                       child: Text(
-                        value,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 28,
-                          fontWeight: FontWeight.bold,
-                          color: levelColor,
+                        unit,
+                        style: const TextStyle(
+                          fontSize: 14,
+                          color: Colors.white54,
                         ),
                       ),
                     ),
-                    if (unit.isNotEmpty) ...[
-                      const SizedBox(width: 5),
-                      Padding(
-                        padding: const EdgeInsets.only(bottom: 4),
-                        child: Text(
-                          unit,
-                          style: const TextStyle(
-                            fontSize: 13,
-                            color: Colors.white54,
-                          ),
-                        ),
-                      ),
-                    ],
                   ],
-                ),
-              ],
-            ),
+                ],
+              ),
+            ],
           ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildStatusAndWarningArea({
-    required String statusText,
-    required Color statusColor,
-    required List<String> warnings,
-  }) {
-    return Column(
-      children: [
-        _buildStatusPanel(
-          statusText: statusText,
-          statusColor: statusColor,
-        ),
-        const SizedBox(height: 12),
-        Expanded(
-          child: _buildWarningsPanel(warnings),
         ),
       ],
-    );
-  }
-
-  Widget _buildStatusPanel({
-    required String statusText,
-    required Color statusColor,
-  }) {
-    final sourceText = _isSerialConnected
-        ? _selectedPort ?? 'COM Port'
-        : _isSimulationRunning
-            ? 'CSV Veri Seti'
-            : _isCsvLoaded
-                ? 'Veri Seti Hazır'
-                : 'Bekleniyor';
-
-    final lastPacketTime = !_hasReceivedData
-        ? '--:--:--'
-        : '${_telemetryData.timestamp.hour.toString().padLeft(2, '0')}:'
-            '${_telemetryData.timestamp.minute.toString().padLeft(2, '0')}:'
-            '${_telemetryData.timestamp.second.toString().padLeft(2, '0')}';
-
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(12),
-      decoration: _panelDecoration(),
-      child: Column(
-        children: [
-          Row(
-            children: [
-              Expanded(
-                child: _statusInfoItem(
-                  title: 'Sistem Durumu',
-                  value: statusText,
-                  valueColor: statusColor,
-                  icon: Icons.monitor_heart_outlined,
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: _statusInfoItem(
-                  title: 'Bağlantı',
-                  value: _getConnectionText(),
-                  valueColor: _getConnectionColor(),
-                  icon: _getConnectionIcon(),
-                  iconColor: _getConnectionColor(),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              Expanded(
-                child: _statusInfoItem(
-                  title: 'Son Paket',
-                  value: lastPacketTime,
-                  valueColor: Colors.white,
-                  icon: Icons.access_time,
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: _statusInfoItem(
-                  title: 'Veri Kaynağı',
-                  value: sourceText,
-                  valueColor: Colors.white,
-                  icon: Icons.dataset_outlined,
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
+    ),
+  );
+}
 
   Widget _statusInfoItem({
     required String title,
@@ -1148,20 +1517,20 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
     Color? iconColor,
   }) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
       decoration: BoxDecoration(
         color: const Color(0xFF050816),
-        borderRadius: BorderRadius.circular(14),
+        borderRadius: BorderRadius.circular(13),
         border: Border.all(color: Colors.white10),
       ),
       child: Row(
         children: [
           Icon(
             icon,
-            size: 20,
+            size: 17,
             color: iconColor ?? Colors.white70,
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: 9),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -1169,17 +1538,17 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
                 Text(
                   title,
                   style: const TextStyle(
-                    fontSize: 11,
+                    fontSize: 9,
                     color: Colors.white54,
                   ),
                 ),
-                const SizedBox(height: 3),
+                const SizedBox(height: 1),
                 Text(
                   value,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
-                    fontSize: 15,
+                    fontSize: 13,
                     fontWeight: FontWeight.bold,
                     color: valueColor,
                   ),
@@ -1201,7 +1570,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
 
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(13),
       decoration: _panelDecoration(),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1211,43 +1580,45 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
               Icon(
                 Icons.warning_amber_rounded,
                 color: panelColor,
+                size: 20,
               ),
               const SizedBox(width: 8),
               const Text(
                 'Uyarı Paneli',
                 style: TextStyle(
-                  fontSize: 19,
+                  fontSize: 17,
                   fontWeight: FontWeight.bold,
                 ),
               ),
               const Spacer(),
               Container(
                 padding: const EdgeInsets.symmetric(
-                  horizontal: 11,
-                  vertical: 6,
+                  horizontal: 10,
+                  vertical: 5,
                 ),
                 decoration: BoxDecoration(
                   color: panelColor.withValues(alpha: 0.15),
-                  borderRadius: BorderRadius.circular(18),
+                  borderRadius: BorderRadius.circular(17),
                 ),
                 child: Text(
                   '${warnings.length} uyarı',
                   style: TextStyle(
                     color: panelColor,
                     fontWeight: FontWeight.bold,
+                    fontSize: 12,
                   ),
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 10),
           if (warnings.isEmpty)
             Container(
               width: double.infinity,
-              padding: const EdgeInsets.all(14),
+              padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
                 color: panelColor.withValues(alpha: 0.08),
-                borderRadius: BorderRadius.circular(14),
+                borderRadius: BorderRadius.circular(13),
                 border: Border.all(
                   color: panelColor.withValues(alpha: 0.35),
                 ),
@@ -1256,7 +1627,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
                 'Aktif uyarı bulunmuyor.',
                 style: TextStyle(
                   color: panelColor,
-                  fontSize: 14,
+                  fontSize: 13,
                   fontWeight: FontWeight.w600,
                 ),
               ),
@@ -1277,8 +1648,8 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
                   return Container(
                     margin: const EdgeInsets.only(bottom: 7),
                     padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 9,
+                      horizontal: 11,
+                      vertical: 8,
                     ),
                     decoration: BoxDecoration(
                       color: itemColor.withValues(alpha: 0.10),
@@ -1294,7 +1665,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
                               ? Icons.error_outline
                               : Icons.warning_amber_rounded,
                           color: itemColor,
-                          size: 18,
+                          size: 17,
                         ),
                         const SizedBox(width: 8),
                         Expanded(
@@ -1304,7 +1675,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
                             overflow: TextOverflow.ellipsis,
                             style: TextStyle(
                               color: itemColor,
-                              fontSize: 13,
+                              fontSize: 12,
                               fontWeight: FontWeight.w700,
                             ),
                           ),
@@ -1320,6 +1691,227 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
     );
   }
 
+  Widget _buildSmartDecisionSupportPanel(List<String> warnings) {
+    final recommendation = _getSmartDecisionRecommendation(warnings);
+
+    final recommendationColor = warnings.isEmpty
+        ? const Color(0xFF22C55E)
+        : getLevelColor(_getOverallWarningLevel());
+
+    final reasons = _getDecisionReasons(warnings);
+    final results = _getExpectedResults(warnings);
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(13),
+      decoration: BoxDecoration(
+        color: const Color(0xFF07111F),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white12),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.20),
+            blurRadius: 12,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(
+                Icons.auto_awesome,
+                color: Colors.white70,
+                size: 18,
+              ),
+              SizedBox(width: 8),
+              Text(
+                'Akıllı Karar Destek Önerisi',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 15,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Expanded(
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFF050816),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: Colors.white10),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Sebep',
+                    style: TextStyle(
+                      color: Colors.white70,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 5),
+                  ...reasons.map(
+                    (reason) => Padding(
+                      padding: const EdgeInsets.only(bottom: 3),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            '• ',
+                            style: TextStyle(
+                              color: Colors.white60,
+                              fontSize: 12,
+                            ),
+                          ),
+                          Expanded(
+                            child: Text(
+                              reason,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const Spacer(),
+                  const Text(
+                    'Öneri',
+                    style: TextStyle(
+                      color: Colors.white70,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 5),
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Icon(
+                        warnings.isEmpty ? Icons.check_circle : Icons.south,
+                        color: recommendationColor,
+                        size: 17,
+                      ),
+                      const SizedBox(width: 7),
+                      Expanded(
+                        child: Text(
+                          recommendation,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: recommendationColor,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                            height: 1.22,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          const Text(
+            'Beklenen Sonuç:',
+            style: TextStyle(
+              color: Colors.white70,
+              fontSize: 12,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              _expectedResultCard(
+                icon: Icons.tune,
+                label: results.firstLabel,
+                value: results.firstValue,
+              ),
+              const SizedBox(width: 8),
+              _expectedResultCard(
+                icon: Icons.bolt,
+                label: results.secondLabel,
+                value: results.secondValue,
+              ),
+              const SizedBox(width: 8),
+              _expectedResultCard(
+                icon: Icons.trending_up,
+                label: results.thirdLabel,
+                value: results.thirdValue,
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _expectedResultCard({
+    required IconData icon,
+    required String label,
+    required String value,
+  }) {
+    return Expanded(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 7),
+        decoration: BoxDecoration(
+          color: const Color(0xFF050816),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.white10),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              icon,
+              color: Colors.white60,
+              size: 15,
+            ),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(
+                label,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Colors.white54,
+                  fontSize: 9,
+                  fontWeight: FontWeight.w600,
+                  height: 1.05,
+                ),
+              ),
+            ),
+            const SizedBox(width: 4),
+            Text(
+              value,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildEnergyRangePanel() {
     final instantPowerKw =
         _hasReceivedData ? _calculateInstantPowerKw(_telemetryData) : 0.0;
@@ -1327,12 +1919,15 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
     final estimatedRangeKm =
         _hasReceivedData ? _calculateEstimatedRangeKm(_telemetryData) : 0.0;
 
+    final efficiencyWhPerKm =
+        _hasReceivedData ? _calculateEfficiencyWhPerKm(_telemetryData) : 0.0;
+
     final calculatedLevel =
         _hasReceivedData ? SensorLevel.normal : SensorLevel.waiting;
 
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(12),
       decoration: _panelDecoration(),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1342,21 +1937,20 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
               Icon(
                 Icons.energy_savings_leaf,
                 color: Color(0xFF38BDF8),
-                size: 18,
+                size: 17,
               ),
-              SizedBox(width: 8),
+              SizedBox(width: 7),
               Text(
                 'Enerji ve Menzil Bilgileri',
                 style: TextStyle(
-                  fontSize: 17,
+                  fontSize: 16,
                   fontWeight: FontWeight.bold,
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 14),
-          SizedBox(
-            height: 115,
+          const SizedBox(height: 10),
+          Expanded(
             child: Row(
               children: [
                 Expanded(
@@ -1369,24 +1963,24 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
                     level: calculatedLevel,
                   ),
                 ),
-                const SizedBox(width: 12),
+                const SizedBox(width: 9),
                 Expanded(
                   child: _buildMiniInfoCard(
-                    title: 'Toplam Enerji Tüketimi',
-                    value: _totalEnergyKwh.toStringAsFixed(3),
-                    unit: 'kWh',
-                    subtitle: 'Zamana bağlı birikimli tüketim',
-                    icon: Icons.battery_charging_full,
+                    title: 'Enerji Verimliliği',
+                    value: efficiencyWhPerKm.toStringAsFixed(1),
+                    unit: 'Wh/km',
+                    subtitle: 'Anlık güç / tahmini hız',
+                    icon: Icons.eco,
                     level: calculatedLevel,
                   ),
                 ),
-                const SizedBox(width: 12),
+                const SizedBox(width: 9),
                 Expanded(
                   child: _buildMiniInfoCard(
                     title: 'Tahmini Kalan Yol',
                     value: estimatedRangeKm.toStringAsFixed(1),
                     unit: 'km',
-                    subtitle: 'SOC ve ortalama tüketime göre',
+                    subtitle: 'SOC ve tüketime göre',
                     icon: Icons.route,
                     level: calculatedLevel,
                   ),
@@ -1399,97 +1993,165 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
     );
   }
 
-  Widget _buildMiniInfoCard({
-    required String title,
-    required String value,
-    required String unit,
-    required String subtitle,
-    required IconData icon,
-    required SensorLevel level,
-  }) {
-    final levelColor = getLevelColor(level);
+  Widget _buildVehicleHealthPanel() {
+    final healthScore = _calculateVehicleHealthScore();
+    final healthStatus = _getVehicleHealthStatus(healthScore);
+    final healthColor = _getVehicleHealthColor(healthScore);
+
+    String description;
+
+    if (!_hasReceivedData) {
+      description =
+          'Telemetri verisi bekleniyor. Sağlık skoru veri akışı başladığında hesaplanacaktır.';
+    } else if (healthScore >= 75) {
+      description =
+          'Sistem genel olarak güvenli bölgede çalışmaktadır. Parametreler kabul edilebilir aralıktadır.';
+    } else if (healthScore >= 50) {
+      description =
+          'Bazı parametreler kritik sınıra yaklaşmıştır. Sistem takip edilmelidir.';
+    } else {
+      description =
+          'Araç riskli bölgede çalışmaktadır. Kritik parametreler kontrol edilmelidir.';
+    }
 
     return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: const Color(0xFF050816),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Colors.white10),
-      ),
-      child: Row(
+      width: double.infinity,
+      padding: const EdgeInsets.all(11),
+      decoration: _panelDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Container(
-            width: 44,
-            height: 44,
-            decoration: BoxDecoration(
-              color: levelColor.withValues(alpha: 0.12),
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(
-                color: levelColor.withValues(alpha: 0.55),
+          Row(
+            children: [
+              Icon(
+                Icons.health_and_safety,
+                color: healthColor,
+                size: 17,
               ),
-            ),
-            child: Icon(
-              icon,
-              color: levelColor,
-              size: 22,
-            ),
+              const SizedBox(width: 7),
+              Text(
+                'Araç Sağlık Skoru',
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.bold,
+                  color: healthColor,
+                ),
+              ),
+            ],
           ),
-          const SizedBox(width: 12),
+          const SizedBox(height: 7),
           Expanded(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 12,
-                    color: Colors.white60,
-                    fontWeight: FontWeight.w700,
-                  ),
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: const Color(0xFF050816),
+                borderRadius: BorderRadius.circular(17),
+                border: Border.all(
+                  color: healthColor.withValues(alpha: 0.35),
                 ),
-                const SizedBox(height: 5),
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: [
-                    Flexible(
-                      child: Text(
-                        value,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 21,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
+              ),
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 78,
+                    height: 78,
+                    child: Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        SizedBox(
+                          width: 78,
+                          height: 78,
+                          child: CircularProgressIndicator(
+                            value: healthScore / 100,
+                            strokeWidth: 8,
+                            backgroundColor:
+                                healthColor.withValues(alpha: 0.18),
+                            valueColor: AlwaysStoppedAnimation<Color>(
+                              healthColor,
+                            ),
+                            strokeCap: StrokeCap.round,
+                          ),
                         ),
-                      ),
-                    ),
-                    const SizedBox(width: 4),
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 3),
-                      child: Text(
-                        unit,
-                        style: const TextStyle(
-                          fontSize: 12,
-                          color: Colors.white54,
+                        Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Text(
+                              '$healthScore',
+                              style: const TextStyle(
+                                fontSize: 24,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.white,
+                              ),
+                            ),
+                            const Text(
+                              '/100',
+                              style: TextStyle(
+                                fontSize: 10,
+                                color: Colors.white54,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ],
                         ),
-                      ),
+                      ],
                     ),
-                  ],
-                ),
-                const SizedBox(height: 3),
-                Text(
-                  subtitle,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 9,
-                    color: Colors.white38,
                   ),
-                ),
-              ],
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Durum: $healthStatus',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                            color: healthColor,
+                          ),
+                        ),
+                        const SizedBox(height: 5),
+                        Text(
+                          description,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 10.5,
+                            height: 1.20,
+                            color: Colors.white70,
+                          ),
+                        ),
+                        const Spacer(),
+                        Row(
+                          children: [
+                            _healthLegendItem(
+                              label: 'Güvenli',
+                              range: '75-100',
+                              color: const Color(0xFF38BDF8),
+                            ),
+                            const SizedBox(width: 5),
+                            _healthLegendItem(
+                              label: 'Dikkat',
+                              range: '50-74',
+                              color: Colors.amber,
+                            ),
+                            const SizedBox(width: 5),
+                            _healthLegendItem(
+                              label: 'Riskli',
+                              range: '0-49',
+                              color: Colors.redAccent,
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  _buildVehicleCarIcon(healthColor),
+                ],
+              ),
             ),
           ),
         ],
@@ -1497,24 +2159,233 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
     );
   }
 
-  Widget _buildChartsPanel() {
-    return Row(
-      children: [
-        Expanded(
-          child: _buildLineChartCard(
-            title: 'Gerilim Grafiği',
-            spots: _voltagePoints,
-            maxY: 5,
-            unit: 'V',
+  Widget _buildVehicleCarIcon(Color color) {
+    return Container(
+      width: 62,
+      height: 62,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: color.withValues(alpha: 0.10),
+        border: Border.all(
+          color: color.withValues(alpha: 0.35),
+          width: 1.3,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: color.withValues(alpha: 0.18),
+            blurRadius: 16,
+            spreadRadius: 1,
+          ),
+        ],
+      ),
+      child: Center(
+        child: Icon(
+          Icons.electric_car_rounded,
+          size: 34,
+          color: color.withValues(alpha: 0.85),
+        ),
+      ),
+    );
+  }
+
+  Widget _healthLegendItem({
+    required String label,
+    required String range,
+    required Color color,
+  }) {
+    return Expanded(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: 0.10),
+          borderRadius: BorderRadius.circular(9),
+          border: Border.all(
+            color: color.withValues(alpha: 0.35),
           ),
         ),
-        const SizedBox(width: 14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: color,
+                fontSize: 8,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 1),
+            Text(
+              range,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white54,
+                fontSize: 6.5,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMiniInfoCard({
+  required String title,
+  required String value,
+  required String unit,
+  required String subtitle,
+  required IconData icon,
+  required SensorLevel level,
+}) {
+  final levelColor = getLevelColor(level);
+
+  return Container(
+    padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+    decoration: BoxDecoration(
+      color: const Color(0xFF050816),
+      borderRadius: BorderRadius.circular(16),
+      border: Border.all(color: Colors.white10),
+    ),
+    child: Row(
+      children: [
+        Container(
+          width: 40,
+          height: 40,
+          decoration: BoxDecoration(
+            color: levelColor.withValues(alpha: 0.12),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: levelColor.withValues(alpha: 0.55),
+            ),
+          ),
+          child: Icon(
+            icon,
+            color: levelColor,
+            size: 20,
+          ),
+        ),
+        const SizedBox(width: 16),
         Expanded(
-          child: _buildLineChartCard(
-            title: 'SOC Grafiği',
-            spots: _groundTruthSocPoints,
-            maxY: 110,
-            unit: '%',
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 11,
+                  color: Colors.white60,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Flexible(
+                    child: Text(
+                      value,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 5),
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 4),
+                    child: Text(
+                      unit,
+                      style: const TextStyle(
+                        fontSize: 13,
+                        color: Colors.white54,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              Text(
+                subtitle,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 8.5,
+                  color: Colors.white38,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+  Widget _buildChartsPanel() {
+    return Column(
+      children: [
+        Expanded(
+          child: Row(
+            children: [
+              Expanded(
+                child: _buildLineChartCard(
+                  title: 'Gerilim Grafiği',
+                  spots: _voltagePoints,
+                  maxY: 5,
+                  unit: 'V',
+                  icon: Icons.bolt,
+                  lineColor: const Color(0xFF22D3EE),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: _buildLineChartCard(
+                  title: 'SOC Grafiği',
+                  spots: _groundTruthSocPoints,
+                  maxY: 110,
+                  unit: '%',
+                  icon: Icons.battery_full,
+                  lineColor: const Color(0xFF4ADE80),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        Expanded(
+          child: Row(
+            children: [
+              Expanded(
+                child: _buildLineChartCard(
+                  title: 'Araç Hızı Grafiği',
+                  spots: _speedPoints,
+                  maxY: 120,
+                  unit: 'km/h',
+                  icon: Icons.speed,
+                  lineColor: const Color(0xFF60A5FA),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: _buildLineChartCard(
+                  title: 'Sıcaklık Grafiği',
+                  spots: _temperaturePoints,
+                  maxY: 60,
+                  unit: '°C',
+                  icon: Icons.thermostat,
+                  lineColor: Colors.redAccent,
+                ),
+              ),
+            ],
           ),
         ),
       ],
@@ -1526,25 +2397,27 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
     required List<FlSpot> spots,
     required double maxY,
     required String unit,
+    required IconData icon,
+    required Color lineColor,
   }) {
     return Container(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(15),
       decoration: _panelDecoration(),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              const Icon(
-                Icons.show_chart,
+              Icon(
+                icon,
                 size: 18,
-                color: Color(0xFF38BDF8),
+                color: lineColor,
               ),
               const SizedBox(width: 8),
               Text(
                 title,
                 style: const TextStyle(
-                  fontSize: 17,
+                  fontSize: 16,
                   fontWeight: FontWeight.bold,
                 ),
               ),
@@ -1558,7 +2431,7 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
               ),
             ],
           ),
-          const SizedBox(height: 10),
+          const SizedBox(height: 9),
           Expanded(
             child: spots.isEmpty
                 ? const Center(
@@ -1607,7 +2480,11 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
                           sideTitles: SideTitles(
                             showTitles: true,
                             reservedSize: 42,
-                            interval: maxY > 100 ? 25 : 1,
+                            interval: maxY >= 100
+                                ? 25
+                                : maxY >= 60
+                                    ? 10
+                                    : 1,
                           ),
                         ),
                       ),
@@ -1615,13 +2492,12 @@ class _TelemetryHomePageState extends State<TelemetryHomePage> {
                         LineChartBarData(
                           spots: spots,
                           isCurved: true,
-                          color: const Color(0xFF22D3EE),
+                          color: lineColor,
                           barWidth: 3,
                           dotData: const FlDotData(show: false),
                           belowBarData: BarAreaData(
                             show: true,
-                            color: const Color(0xFF22D3EE)
-                                .withValues(alpha: 0.16),
+                            color: lineColor.withValues(alpha: 0.16),
                           ),
                         ),
                       ],
